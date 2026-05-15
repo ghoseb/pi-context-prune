@@ -67,6 +67,12 @@ export const PROGRESS_WIDGET_ID = "context-prune-progress";
 /** Name of the context_prune tool (injected only when agentic-auto mode is active) */
 export const CONTEXT_PRUNE_TOOL_NAME = "context_prune";
 
+/** Individual tool-call results shorter than this are excluded from batches. */
+export const MIN_MSG_CHARS = 180;
+
+/** Batches whose total filtered result text is below this are discarded. */
+export const MIN_BATCH_CHARS = 400;
+
 /** System prompt injected when agentic-auto mode is active */
 export const AGENTIC_AUTO_SYSTEM_PROMPT = `[Context Prune — Agentic Auto Mode]
 You have access to the context_prune tool. Use it to summarize and compact preceding tool-call results from context.

@@ -32,6 +32,8 @@ import {
   CUSTOM_TYPE_INDEX,
   CUSTOM_TYPE_STATS,
   CUSTOM_TYPE_FRONTIER,
+  MIN_MSG_CHARS,
+  MIN_BATCH_CHARS,
 } from "./src/types.js";
 import { StatsAccumulator } from "./src/stats.js";
 import { registerContextPruneTool } from "./src/context-prune-tool.js";
@@ -109,6 +111,13 @@ export default function (pi: ExtensionAPI) {
     return { ...batch, toolCalls: remaining };
   };
 
+  const applyThresholdFilter = (batch: CapturedBatch): CapturedBatch | null => {
+    const filtered = batch.toolCalls.filter((tc) => tc.resultText.length >= MIN_MSG_CHARS);
+    const totalChars = filtered.reduce((sum, tc) => sum + tc.resultText.length, 0);
+    if (totalChars < MIN_BATCH_CHARS) return null;
+    return filtered.length === batch.toolCalls.length ? batch : { ...batch, toolCalls: filtered };
+  };
+
   const restoreBatches = (batches: CapturedBatch[]) => {
     pendingBatches.unshift(...batches);
   };
@@ -145,7 +154,9 @@ export default function (pi: ExtensionAPI) {
     batches = batches
       .map((batch) => trimBatchToPendingRange(batch))
       .filter((batch): batch is CapturedBatch => batch !== null);
-    return groupBatchesByMode(batches, currentConfig.value.batchingMode);
+    return groupBatchesByMode(batches, currentConfig.value.batchingMode)
+      .map((batch) => applyThresholdFilter(batch))
+      .filter((batch): batch is CapturedBatch => batch !== null);
   };
 
   // Summarizes + indexes all pending batches.
@@ -230,7 +241,7 @@ export default function (pi: ExtensionAPI) {
       let totalRawCharCount = 0;
       let totalSummaryCharCount = 0;
       let totalToolCallCount = 0;
-      const oversizedBatches: CapturedBatch[] = [];
+      const oversizedBatches: { batch: CapturedBatch; summaryLen: number }[] = [];
       let firstFailureIndex = -1;
 
       for (let i = 0; i < batches.length; i++) {
@@ -269,7 +280,7 @@ export default function (pi: ExtensionAPI) {
               persistBatchIndex(batch, appendEntry);
             }
           } else {
-            oversizedBatches.push(batch);
+            oversizedBatches.push({ batch, summaryLen: summaryText.length });
           }
         } catch (err) {
           // Persistence error mid-loop: stop here, restore this and remaining batches.
@@ -332,12 +343,11 @@ export default function (pi: ExtensionAPI) {
       setPruneStatusWidget(ctx, currentConfig.value, statsAccum.getStats());
 
       // Notify about any oversized batches that were skipped
-      for (const batch of oversizedBatches) {
+      for (const { batch, summaryLen } of oversizedBatches) {
         const batchRaw = batch.toolCalls.reduce((s, tc) => s + tc.resultText.length, 0);
-        const batchSummaryLen = results[batches.indexOf(batch)]?.summaryText.length ?? 0;
         safeNotify(
           ctx,
-          `pruner: skipped pruning turn ${batch.turnIndex} (${batch.toolCalls.length} tool call${batch.toolCalls.length === 1 ? "" : "s"}) — summary was ${batchSummaryLen} chars vs ${batchRaw} raw chars; frontier advanced past this range`,
+          `pruner: skipped pruning turn ${batch.turnIndex} (${batch.toolCalls.length} tool call${batch.toolCalls.length === 1 ? "" : "s"}) — summary was ${summaryLen} chars vs ${batchRaw} raw chars; frontier advanced past this range`,
           "warning"
         );
       }
@@ -451,7 +461,10 @@ export default function (pi: ExtensionAPI) {
     });
     if (!batch) return;
 
-    pendingBatches.push(batch);
+    const thresholdedBatch = applyThresholdFilter(batch);
+    if (!thresholdedBatch) return;
+
+    pendingBatches.push(thresholdedBatch);
 
     if (currentConfig.value.pruneOn === "every-turn") {
       await flushPending(ctx, { delivery: "session" });
