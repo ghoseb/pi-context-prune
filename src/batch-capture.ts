@@ -65,8 +65,24 @@ export function captureUnindexedBatchesFromSession(
 ): CapturedBatch[] {
   // branch is SessionEntry[]. Each message entry has { type: "message", message: AgentMessage }.
   // We must unwrap the SessionEntry wrapper before accessing role/toolCallId.
+
+  // Skip everything at or before the most recent compaction boundary.  Tool
+  // calls that predate a compaction are already summarised by Pi; re-scanning
+  // them wastes LLM tokens and produces thousands of spurious pending batches
+  // when opening a large old session.
+  let scanStart = 0;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    if (branch[i].type === "compaction") {
+      scanStart = i + 1;
+      break;
+    }
+  }
+  const scanBranch = scanStart > 0 ? branch.slice(scanStart) : branch;
+
+  // resultMap only needs post-compaction entries — pre-compaction tool results
+  // are already indexed and would be excluded by the indexer check anyway.
   const resultMap = new Map<string, any>();
-  for (const entry of branch) {
+  for (const entry of scanBranch) {
     if (entry.type !== "message") continue;
     const m = entry.message;
     if (m.role === "toolResult" && m.toolCallId) {
@@ -75,34 +91,39 @@ export function captureUnindexedBatchesFromSession(
   }
 
   const batches: CapturedBatch[] = [];
-  // turnCounter increments for EVERY assistant message (not just prunable ones).
-  // This makes turnIndex stable across multiple prune cycles: pruning removes
-  // ToolResultMessages from the context event but leaves AssistantMessages in the
-  // session branch, so the count of all assistant messages never decreases and
-  // always matches Pi's own event.turnIndex numbering.
+  // turnCounter must count every assistant message from the START of the full
+  // branch (not just the scan window) so that turnIndex values stay in sync with
+  // Pi's own event.turnIndex numbering.  trimBatchToPendingRange compares against
+  // frontier.lastAttemptedTurnIndex which was recorded from a live turn_end event,
+  // so the two must use the same counting basis.
   let turnCounter = 0;
 
-  // userTurnGroup increments on every user message seen while walking the branch.
+  // userTurnGroup increments on every user message seen in the scan window.
   // All assistant tool-call batches between two consecutive user messages share the
   // same userTurnGroup. This is used by groupBatchesByMode to merge turns within
   // a single user → final-agent-message span when batchingMode === "agent-message".
   let userTurnGroup = 0;
 
-  for (const entry of branch) {
+  for (let idx = 0; idx < branch.length; idx++) {
+    const entry = branch[idx];
     if (entry.type !== "message") continue;
     const msg = entry.message;
 
-    // Advance userTurnGroup on every user message so all subsequent assistant
-    // batches get a new group number.
     if (msg.role === "user") {
-      userTurnGroup++;
+      // Only advance userTurnGroup inside the scan window; pre-compaction user
+      // messages are irrelevant to current grouping.
+      if (idx >= scanStart) userTurnGroup++;
       continue;
     }
 
     if (msg.role !== "assistant") continue;
 
-    // Stable turn index: count every assistant message regardless of pruning state
+    // Always increment — even for pre-compaction turns we haven't scanned.
     const currentTurnIndex = turnCounter++;
+
+    // Skip batch construction for pre-compaction entries; we only need the
+    // turnCounter to stay in sync.
+    if (idx < scanStart) continue;
 
     const content = Array.isArray(msg.content) ? msg.content : [];
     const toolCallBlocks = content.filter((c: any) => c.type === "toolCall");
@@ -148,13 +169,16 @@ export function serializeBatchForSummarizer(batch: CapturedBatch): string {
 
   const toolParts = batch.toolCalls.map((tc) => {
     const status = tc.isError ? "ERROR" : "OK";
-    const argsJson = JSON.stringify(tc.args, null, 2);
+    const MAX_CHARS = 2000;
+
+    let argsJson = JSON.stringify(tc.args, null, 2);
+    if (argsJson.length > MAX_CHARS) {
+      argsJson = argsJson.slice(0, MAX_CHARS) + ` ...[${argsJson.length - MAX_CHARS} chars truncated]`;
+    }
 
     let resultText = tc.resultText;
-    const MAX_CHARS = 2000;
     if (resultText.length > MAX_CHARS) {
-      const remaining = resultText.length - MAX_CHARS;
-      resultText = resultText.slice(0, MAX_CHARS) + ` ...[${remaining} chars truncated]`;
+      resultText = resultText.slice(0, MAX_CHARS) + ` ...[${resultText.length - MAX_CHARS} chars truncated]`;
     }
 
     return `Tool: ${tc.toolName}(${argsJson})\nResult (${status}): ${resultText}`;
